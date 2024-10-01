@@ -20,6 +20,7 @@ with any other format that supports pyramid layers and statistics
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import sys
 import os
 
 import numpy
@@ -413,7 +414,7 @@ class SinglePassManager:
         self.STATISTICS = 1
         self.HISTOGRAM = 2
         self.histSupportedDtypes = numpySignedIntTypes + numpyUnsignedIntTypes
-        self.supportedAggtypes = ("NEAREST", )
+        self.supportedAggtypes = ("NEAREST", "AVERAGE")
 
         self.omit = {}
         self.singlePassRequested = {}
@@ -462,6 +463,7 @@ class SinglePassManager:
             aggType = controls.getOptionForImagename(
                 'overviewAggType', symbolicName)
             if aggType is None:
+                # Note we are ignoring DEFAULT_OVERVIEWAGGREGRATIONTYPE here
                 aggType = "NEAREST"
             self.oviewAggtype[symbolicName] = aggType
             minOverviewDim = controls.getOptionForImagename(
@@ -471,6 +473,24 @@ class SinglePassManager:
                 if (mindim // lvl) > minOverviewDim:
                     nOverviews += 1
             self.overviewLevels[symbolicName] = oviewLvls[:nOverviews]
+
+            # Some safety checks on the use of 'AVERAGE' pyramid aggregation
+            spPyrReq = self.singlePassRequested[symbolicName, self.PYRAMIDS]
+            if (self.oviewAggtype[symbolicName] == "AVERAGE" and
+                    not self.oviewLvlsDivisible(symbolicName) and
+                    spPyrReq is not False):
+                msg = ("Overview levels for output '{}' are not divisible, " +
+                    "which is required for 'AVERAGE' pyramid " +
+                    "aggregation with single-pass. ").format(symbolicName)
+                if spPyrReq is None:
+                    # Fall back to GDAL
+                    msg = msg + "Falling back to GDAL"
+                    print(msg, file=sys.stderr)
+                    self.singlePassRequested[symbolicName, self.PYRAMIDS] = False
+                elif spPyrReq is True:
+                    # Cannot do as requested, so raise an exception
+                    msg = msg + "Explicit single-pass requested, but not possible"
+                    raise SinglePassActionsError(msg)
 
     def checkDriverPyramidSupport(self, outfiles, controls, tmpfileMgr):
         """
@@ -514,6 +534,22 @@ class SinglePassManager:
                 supported = (arr_sub2 == fillVal).all()
                 driverSupportsPyramids[driverName] = supported
         return driverSupportsPyramids
+
+    def oviewLvlsDivisible(self, symbolicName):
+        """
+        Check if the requested pyramid/overview levels for symbolicName are
+        divisible. Each level value must be divisible by the previous one.
+        Return False if this is untrue for any level
+        """
+        allDivisible = True
+        oviewLvls = self.overviewLevels[symbolicName]
+        numLvls = len(oviewLvls)
+        for i in range(1, numLvls):
+            lvl = oviewLvls[i]
+            prevLvl = oviewLvls[i - 1]
+            if (lvl % prevLvl) != 0:
+                allDivisible = False
+        return allDivisible
 
     def initFor(self, ds, symbolicName, seqNum, arr):
         """
@@ -825,27 +861,93 @@ def writeBlockPyramids(ds, arr, singlePassMgr, symbolicName, xOff, yOff):
 
     """
     overviewLevels = singlePassMgr.overviewLevels[symbolicName]
-    nOverviews = len(overviewLevels)
 
     numBands = arr.shape[0]
     for i in range(numBands):
         band = ds.GetRasterBand(i + 1)
-        for j in range(nOverviews):
-            band_ov = band.GetOverview(i)
-            lvl = overviewLevels[i]
-            # Offset from top-left edge
-            o = lvl // 2
-            # Sub-sample by taking every lvl-th pixel in each direction
-            arr_sub = arr[i, o::lvl, o::lvl]
-            # The xOff/yOff of the block within the sub-sampled raster
-            xOff_sub = xOff // lvl
-            yOff_sub = yOff // lvl
-            # The actual number of rows and cols to write, ensuring we
-            # do not go off the edges
-            nc = band_ov.XSize - xOff_sub
-            nr = band_ov.YSize - yOff_sub
-            arr_sub = arr_sub[:nr, :nc]
-            band_ov.WriteArray(arr_sub, xOff_sub, yOff_sub)
+        aggType = singlePassMgr.oviewAggtype[symbolicName]
+        if aggType == "NEAREST":
+            writeBlockPyramids_nearest(band, overviewLevels, arr[i], xOff, yOff)
+        elif aggType == "AVERAGE":
+            nullVal = band.GetNoDataValue()
+            writeBlockPyramids_average(band, overviewLevels, arr[i],
+                xOff, yOff, nullVal)
+
+
+def writeBlockPyramids_nearest(band, overviewLevels, arr, xOff, yOff):
+    """
+    Write the overviews for all requested levels, for the given band and array,
+    using NEAREST aggregation
+    """
+    nOverviews = len(overviewLevels)
+    for j in range(nOverviews):
+        band_ov = band.GetOverview(j)
+        lvl = overviewLevels[j]
+        # Offset from top-left edge
+        o = lvl // 2
+        # Sub-sample by taking every lvl-th pixel in each direction
+        arr_sub = arr[o::lvl, o::lvl]
+        # The xOff/yOff of the block within the sub-sampled raster
+        xOff_sub = xOff // lvl
+        yOff_sub = yOff // lvl
+        # The actual number of rows and cols to write, ensuring we
+        # do not go off the edges
+        nc = band_ov.XSize - xOff_sub
+        nr = band_ov.YSize - yOff_sub
+        arr_sub = arr_sub[:nr, :nc]
+        band_ov.WriteArray(arr_sub, xOff_sub, yOff_sub)
+
+
+def writeBlockPyramids_average(band, overviewLevels, arr, xOff, yOff, nullVal):
+    """
+    Write the overviews for all requested levels, for the given band and array,
+    using AVERAGE aggregation. Any low-res pixel containing at least one high-res
+    null value is then marked as null.
+
+    Each overview array is calculated by averaging the previous array, by the 
+    factor relating this level to the one before. This only works because each
+    level value is a multiple of the previous one. That is why we check this
+    back in the constructor for SinglePassMgr. Doing it this way saves a lot
+    of time, relative to calculating each level from the original array. (I did
+    compare them, and it was huge)
+
+    """
+    nOverviews = len(overviewLevels)
+    prevArr = arr
+    prevLvl = 1
+    nullmask = None
+    for j in range(nOverviews):
+        band_ov = band.GetOverview(j)
+        lvl = overviewLevels[j]
+        factor = lvl // prevLvl
+
+        subsetList = []
+        for o_i in range(factor):
+            for o_j in range(factor):
+                sub = prevArr[o_i::factor, o_j::factor]
+                subsetList.append(sub)
+
+        # If any are of different dimensions, use the smallest for all
+        nRows = min([sub.shape[0] for sub in subsetList])
+        nCols = min([sub.shape[1] for sub in subsetList])
+        arr_sum = subsetList[0][:nRows, :nCols].astype(numpy.float64)
+        for sub in subsetList[1:]:
+            arr_sum += sub[:nRows, :nCols]
+        oview_arr = (arr_sum / len(subsetList)).astype(arr.dtype)
+
+        if nullVal is not None:
+            for sub in subsetList:
+                nullmask = (sub[:nRows, :nCols] == nullVal)
+                oview_arr[nullmask] = nullVal
+
+        # The xOff/yOff of the block within the sub-sampled raster
+        xOff_sub = xOff // lvl
+        yOff_sub = yOff // lvl
+
+        band_ov.WriteArray(oview_arr, xOff_sub, yOff_sub)
+
+        prevArr = oview_arr
+        prevLvl = lvl
 
 
 def finishSinglePassStats(ds, singlePassMgr, symbolicName, seqNum):
