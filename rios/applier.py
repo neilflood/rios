@@ -507,7 +507,8 @@ class ApplierControls(object):
         New in version 1.4.1
 
         """
-        self.setOptionForImagename('overviewLevels', imagename, overviewLevels)
+        self.setOptionForImagename('overviewLevels', imagename,
+                                   sorted(overviewLevels))
 
     def setOverviewMinDim(self, overviewMinDim, imagename=None):
         """
